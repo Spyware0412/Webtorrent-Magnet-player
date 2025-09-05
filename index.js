@@ -8,48 +8,137 @@ app.use(cors());
 app.use(express.json());
 
 const client = new WebTorrent();
+// Add this at the top
+const torrentsMap = new Map(); // magnet URI or infoHash -> torrent
 
 app.get("/stream", (req, res) => {
   const magnetUri = req.query.magnet;
-  if (!magnetUri) {
-    return res.status(400).send("Magnet link required");
+  if (!magnetUri) return res.status(400).send("Magnet link required");
+
+  let torrent = torrentsMap.get(magnetUri);
+
+  if (torrent) {
+    // Torrent already exists, just stream
+    streamTorrent(torrent, req, res);
+    return;
   }
+
+  // Add new torrent
+  torrent = client.add(magnetUri, (t) => {
+    streamTorrent(t, req, res);
+  });
+
+  // Save in map to prevent duplicates
+  torrentsMap.set(magnetUri, torrent);
+
+  // Optional: clean up map when torrent is done
+  torrent.on("done", () => {
+    console.log(`Torrent finished: ${torrent.infoHash}`);
+    // torrentsMap.delete(magnetUri); // if you want to remove after complete
+  });
+});
+
+function streamTorrent(torrent, req, res) {
+  const file = torrent.files.find(f => f.name.endsWith(".mp4") || f.name.endsWith(".mkv"));
+  if (!file) return res.status(404).send("No video file found");
+
+  const total = file.length;
+  const range = req.headers.range;
+  let start = 0, end = total - 1;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    start = parseInt(parts[0], 10);
+    end = parts[1] ? parseInt(parts[1], 10) : end;
+  }
+
+  const chunkSize = end - start + 1;
+  const headers = range
+    ? {
+        "Content-Range": `bytes ${start}-${end}/${total}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunkSize,
+        "Content-Type": "video/mp4",
+      }
+    : {
+        "Content-Length": total,
+        "Content-Type": "video/mp4",
+      };
+
+  res.writeHead(range ? 206 : 200, headers);
+
+  file.createReadStream({ start, end })
+    .on('error', (err) => {
+      if (err.message.includes('closed prematurely')) {
+        console.log('Stream closed by client');
+      } else {
+        console.error('Stream error:', err);
+      }
+    })
+    .pipe(res)
+    .on('error', (err) => {
+      if (err.message.includes('closed prematurely')) {
+        console.log('Response closed by client');
+      } else {
+        console.error('Response stream error:', err);
+      }
+    });
+}
+
+app.get("/stream", (req, res) => {
+  const magnetUri = req.query.magnet;
+  if (!magnetUri) return res.status(400).send("Magnet link required");
 
   client.add(magnetUri, (torrent) => {
     const file = torrent.files.find(f =>
       f.name.endsWith(".mp4") || f.name.endsWith(".mkv")
     );
-    if (!file) {
-      return res.status(404).send("No video file found in torrent");
-    }
+    if (!file) return res.status(404).send("No video file found in torrent");
 
     const total = file.length;
     const range = req.headers.range;
 
-    if (!range) {
-      // No range header → send entire file
-      res.writeHead(200, {
-        "Content-Length": total,
-        "Content-Type": "video/mp4",
-      });
-      file.createReadStream().pipe(res);
-      return;
+    let start = 0;
+    let end = total - 1;
+
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      start = parseInt(parts[0], 10);
+      end = parts[1] ? parseInt(parts[1], 10) : end;
     }
 
-    // Parse Range header (e.g. "bytes=0-1023")
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
-
     const chunkSize = end - start + 1;
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${total}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": chunkSize,
-      "Content-Type": "video/mp4",
-    });
 
-    file.createReadStream({ start, end }).pipe(res);
+    const headers = range
+      ? {
+          "Content-Range": `bytes ${start}-${end}/${total}`,
+          "Accept-Ranges": "bytes",
+          "Content-Length": chunkSize,
+          "Content-Type": "video/mp4",
+        }
+      : {
+          "Content-Length": total,
+          "Content-Type": "video/mp4",
+        };
+
+    res.writeHead(range ? 206 : 200, headers);
+
+    file.createReadStream({ start, end })
+      .on('error', (err) => {
+        if (err.message.includes('closed prematurely')) {
+          console.log('Stream closed by client');
+        } else {
+          console.error('Stream error:', err);
+        }
+      })
+      .pipe(res)
+      .on('error', (err) => {
+        if (err.message.includes('closed prematurely')) {
+          console.log('Response closed by client');
+        } else {
+          console.error('Response stream error:', err);
+        }
+      });
 
     torrent.on("download", () => {
       console.log(`Progress: ${(torrent.progress * 100).toFixed(2)}%`);
@@ -60,7 +149,6 @@ app.get("/stream", (req, res) => {
     });
   });
 });
-
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
